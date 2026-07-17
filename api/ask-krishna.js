@@ -1,16 +1,23 @@
 // api/ask-krishna.js
 // Vercel serverless function — Ask Krishna feature for nuantra.com
-// Uses Groq API (free tier) with a two-layer safety architecture:
-//   Layer 1: Llama Guard classifies the INCOMING question before anything is generated
-//   Layer 2: Llama Guard classifies the OUTGOING answer before it is returned to the user
-// If either layer flags unsafe content, a fixed safe fallback is returned instead —
-// the main model's output never reaches the user unchecked.
+// Uses Groq API (free tier) for generation.
+//
+// SAFETY DESIGN:
+// Krishna's system prompt is the primary safeguard — it explicitly instructs
+// the model on how to handle crisis content (redirect to real help, never
+// counsel through it with philosophy alone, never discourage medical care,
+// never suggest self-harm or violence).
+//
+// A deterministic keyword-based check then scans the OUTPUT text as a
+// backstop, looking for a narrow, specific list of genuinely dangerous
+// patterns. This replaced an earlier Llama-Guard-based classifier, which in
+// testing repeatedly flagged ordinary supportive content (e.g. encouragement
+// through unemployment/job loss) as unsafe — false positives that blocked
+// legitimate, benign responses. A keyword check on explicit dangerous
+// patterns is more predictable and auditable than a black-box classifier
+// that was misfiring on this content.
 
 const GROQ_URL = "https://api.groq.com/openai/v1/chat/completions";
-
-// Models — verify current availability at https://console.groq.com/docs/models
-// Llama Guard is Groq's dedicated moderation/classification model.
-const GUARD_MODEL = "llama-guard-3-8b";
 const CHAT_MODEL = "llama-3.3-70b-versatile";
 
 const KRISHNA_SYSTEM_PROMPT = `You are speaking in the voice and spirit of Krishna as he counseled Arjuna in the Bhagavad Gita — a steady, compassionate, wise presence who helps a person see their situation with more clarity and less fear.
@@ -22,19 +29,30 @@ Rules you always follow, without exception:
 4. If someone's message describes a crisis — thoughts of self-harm, suicide, harming someone else, or being in immediate danger — you do not attempt to counsel them through it with philosophy alone. You respond with warmth, take it seriously, and clearly direct them toward real human help (a mental health professional, a crisis line, someone they trust) before anything else.
 5. Your guidance draws from the Gita's teachings — duty (dharma), detachment from outcomes (nishkama karma), steadiness of mind (sthitaprajna), impermanence, the difference between the self and the ego. You speak with warmth, not lecture. Short, clear, human — not a wall of Sanskrit terms.
 6. You are not a licensed therapist and you never claim to be one. Spiritual guidance complements professional help; it does not replace it.
-7. Keep responses under 200 words. Grounded, specific to what they actually said — not generic verses.`;
-
-const SAFE_FALLBACK_INPUT_FLAGGED = `I can hear that you're going through something heavy right now. This is bigger than something I can help with alone — please reach out to someone who can actually be there with you.
-
-If you're in India: iCall — 9152987821, or AASRA — 9820466726, or Kiran (Govt. of India) — 1800-599-0019.
-
-If you're somewhere else, please contact your local emergency number or a crisis helpline right away, or talk to someone you trust.
-
-You deserve real support, not just words. Please reach out now.`;
+7. Keep responses under 200 words. Grounded, specific to what they actually said — not generic verses.
+8. Ordinary life struggles — job loss, career uncertainty, family pressure, financial stress, relationship conflict, self-doubt — are NOT crises. Respond to these with genuine Gita-rooted encouragement and perspective, not a redirect to helplines. Only redirect to professional/crisis help when the person describes actual thoughts of self-harm, suicide, or harming someone else.`;
 
 const SAFE_FALLBACK_OUTPUT_FLAGGED = `I want to make sure you get guidance that truly helps rather than something that could cause harm. For what you're describing, please speak with a mental health professional or a trusted person in your life — they can support you in ways I can't.
 
 If you're in India: iCall — 9152987821, or AASRA — 9820466726, or Kiran (Govt. of India) — 1800-599-0019.`;
+
+// Narrow, explicit list of genuinely dangerous patterns.
+// This is intentionally conservative — it should only catch clear, unambiguous
+// instances of harmful instruction, not emotional language or distress themes.
+const DANGEROUS_PATTERNS = [
+  /don'?t (see|go to|visit|consult) a (doctor|therapist|psychiatrist|professional)/i,
+  /no need (for|to see) (a doctor|therapy|professional help|medical)/i,
+  /(cut|hurt|harm) yourself/i,
+  /take (all|a lot of|handful of) (pills|medication|tablets)/i,
+  /(way|method|how) to (kill|end your life|take your (own )?life)/i,
+  /you should (kill|hurt|harm) (them|him|her|someone)/i,
+  /stop taking (your|the) medication/i,
+  /isolate (yourself )?from (everyone|family|friends|people who care)/i,
+];
+
+function containsDangerousPattern(text) {
+  return DANGEROUS_PATTERNS.some(pattern => pattern.test(text));
+}
 
 async function callGroq(model, messages, maxTokens) {
   const res = await fetch(GROQ_URL, {
@@ -47,7 +65,7 @@ async function callGroq(model, messages, maxTokens) {
       model,
       messages,
       max_tokens: maxTokens,
-      temperature: model === CHAT_MODEL ? 0.7 : 0
+      temperature: 0.7
     })
   });
   if (!res.ok) {
@@ -55,22 +73,6 @@ async function callGroq(model, messages, maxTokens) {
     throw new Error(`Groq API error (${res.status}): ${errText}`);
   }
   return res.json();
-}
-
-// Returns true if Llama Guard flags the text as unsafe
-async function isUnsafe(text) {
-  try {
-    const result = await callGroq(GUARD_MODEL, [
-      { role: "user", content: text }
-    ], 20);
-    const verdict = (result.choices?.[0]?.message?.content || "").toLowerCase();
-    // Llama Guard responds with "safe" or "unsafe\n<category>"
-    return verdict.includes("unsafe");
-  } catch (e) {
-    // If the safety check itself fails, fail closed — treat as unsafe
-    console.error("Safety check failed:", e.message);
-    return true;
-  }
 }
 
 export default async function handler(req, res) {
@@ -90,21 +92,6 @@ export default async function handler(req, res) {
     return res.status(400).json({ error: "Question is too long." });
   }
 
-  // NOTE ON SAFETY DESIGN:
-  // We deliberately do NOT run a standalone input-side safety block based on
-  // Llama Guard's raw verdict. In testing, Llama Guard frequently flags ordinary
-  // emotional or life-struggle content (job loss, grief, family conflict) as
-  // "unsafe" due to distress-adjacent language, even with no self-harm or
-  // violence content present. Blocking on that alone produces false positives
-  // that deny real, benign questions a response.
-  //
-  // Instead: Krishna's system prompt explicitly instructs the model on how to
-  // handle genuine crisis content (redirect to real help, don't counsel through
-  // it with philosophy) — the model reads full context, not just keywords.
-  // The OUTPUT is then checked by Llama Guard before reaching the user — this
-  // is the real backstop. If the model's response is itself ever unsafe, it
-  // never reaches the person.
-
   try {
     const completion = await callGroq(CHAT_MODEL, [
       { role: "system", content: KRISHNA_SYSTEM_PROMPT },
@@ -120,9 +107,9 @@ export default async function handler(req, res) {
       });
     }
 
-    // Output-side safety check — the real backstop
-    const outputFlagged = await isUnsafe(answer);
-    if (outputFlagged) {
+    // Deterministic backstop check on the actual output text
+    if (containsDangerousPattern(answer)) {
+      console.warn("Dangerous pattern matched in output — serving fallback.");
       return res.status(200).json({
         answer: SAFE_FALLBACK_OUTPUT_FLAGGED,
         flagged: true
