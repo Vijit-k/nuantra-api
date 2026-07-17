@@ -90,17 +90,22 @@ export default async function handler(req, res) {
     return res.status(400).json({ error: "Question is too long." });
   }
 
-  try {
-    // LAYER 1 — check the incoming question before generating anything
-    const inputFlagged = await isUnsafe(question);
-    if (inputFlagged) {
-      return res.status(200).json({
-        answer: SAFE_FALLBACK_INPUT_FLAGGED,
-        flagged: true
-      });
-    }
+  // NOTE ON SAFETY DESIGN:
+  // We deliberately do NOT run a standalone input-side safety block based on
+  // Llama Guard's raw verdict. In testing, Llama Guard frequently flags ordinary
+  // emotional or life-struggle content (job loss, grief, family conflict) as
+  // "unsafe" due to distress-adjacent language, even with no self-harm or
+  // violence content present. Blocking on that alone produces false positives
+  // that deny real, benign questions a response.
+  //
+  // Instead: Krishna's system prompt explicitly instructs the model on how to
+  // handle genuine crisis content (redirect to real help, don't counsel through
+  // it with philosophy) — the model reads full context, not just keywords.
+  // The OUTPUT is then checked by Llama Guard before reaching the user — this
+  // is the real backstop. If the model's response is itself ever unsafe, it
+  // never reaches the person.
 
-    // Generate Krishna's response
+  try {
     const completion = await callGroq(CHAT_MODEL, [
       { role: "system", content: KRISHNA_SYSTEM_PROMPT },
       { role: "user", content: question }
@@ -115,7 +120,7 @@ export default async function handler(req, res) {
       });
     }
 
-    // LAYER 2 — check the outgoing answer before it reaches the user
+    // Output-side safety check — the real backstop
     const outputFlagged = await isUnsafe(answer);
     if (outputFlagged) {
       return res.status(200).json({
