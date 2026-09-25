@@ -18,7 +18,8 @@
 // that was misfiring on this content.
 
 const GROQ_URL = "https://api.groq.com/openai/v1/chat/completions";
-const CHAT_MODEL = "llama-3.3-70b-versatile";
+// llama-3.3-70b-versatile was retired by Groq on 2026-08-16; gpt-oss-120b is Groq's named replacement.
+const CHAT_MODEL = "openai/gpt-oss-120b";
 
 const KRISHNA_SYSTEM_PROMPT = `You are speaking in the voice and spirit of Krishna as he counseled Arjuna in the Bhagavad Gita — a steady, compassionate, wise presence who helps a person see their situation with more clarity and less fear.
 
@@ -71,7 +72,10 @@ async function callGroq(model, messages, maxTokens) {
       model,
       messages,
       max_tokens: maxTokens,
-      temperature: 0.7
+      temperature: 0.7,
+      // gpt-oss is a reasoning model: its hidden reasoning counts toward
+      // max_tokens, so keep reasoning light and leave room for the answer.
+      reasoning_effort: "low"
     })
   });
   if (!res.ok) {
@@ -102,7 +106,7 @@ export default async function handler(req, res) {
     const completion = await callGroq(CHAT_MODEL, [
       { role: "system", content: KRISHNA_SYSTEM_PROMPT },
       { role: "user", content: question }
-    ], 400);
+    ], 1500);
 
     const answer = completion.choices?.[0]?.message?.content?.trim();
 
